@@ -101,7 +101,8 @@ SMTP_PORT = 465
 SMTP_TIMEOUT = 25
 
 # Small delay between submissions handled by each worker.
-SEND_DELAY_SECONDS = 0.8
+# Keep low for serverless environments (like Vercel) to avoid timeouts.
+SEND_DELAY_SECONDS = 0.2
 
 
 # =========================================================
@@ -461,7 +462,6 @@ def build_message(
             "utf-8",
         )
 
-    # Standard mail headers.
     message["Subject"] = subject
 
     message["From"] = formataddr(
@@ -488,10 +488,6 @@ def build_message(
 
 def normalize_recipient(item):
 
-    # Simple email:
-    #
-    # "user@example.com"
-
     if isinstance(item, str):
 
         return {
@@ -502,17 +498,6 @@ def normalize_recipient(item):
             "thanks": "",
             "ref_code": "",
         }
-
-    # Detailed recipient:
-    #
-    # {
-    #   "email": "...",
-    #   "name": "...",
-    #   "hi": "Hi",
-    #   "hello": "Hello",
-    #   "thanks": "Thanks",
-    #   "ref_code": "HF8552"
-    # }
 
     if not isinstance(item, dict):
         return None
@@ -540,9 +525,6 @@ def normalize_recipient(item):
     ref_code = str(
         item.get("ref_code", "") or ""
     ).strip()
-
-    # Clean values that might appear
-    # inside the email body.
 
     name = (
         name
@@ -592,14 +574,6 @@ def create_smtp_connection(
     gmail,
     app_password,
 ):
-    """
-    Creates one authenticated Gmail SMTP connection.
-
-    A worker can reuse this connection for multiple
-    recipients instead of creating a new SMTP connection
-    for every single email.
-    """
-
     clean_app_password = re.sub(
         r"\s+",
         "",
@@ -645,9 +619,6 @@ def send_one_email(
             "",
         )
     )
-
-    # Personalization happens only for
-    # placeholders actually used.
 
     personalized_subject = (
         personalize_template(
@@ -716,7 +687,6 @@ def send_worker(
 
     try:
 
-        # One connection for this worker.
         smtp_server = create_smtp_connection(
             gmail,
             app_password,
@@ -1018,7 +988,6 @@ def send_batch():
             + "\n"
         )
 
-        # Do not create more workers than needed.
         worker_count = min(
             MAX_PARALLEL_SENDS,
             total,
