@@ -291,7 +291,6 @@ def verify_turnstile(token, remote_ip=None):
     )
 
     try:
-
         with urllib.request.urlopen(
             req,
             timeout=10,
@@ -304,13 +303,15 @@ def verify_turnstile(token, remote_ip=None):
         if result.get("success") is True:
             return True, None
 
+        # Print error codes to Vercel logs for debugging
+        print("Turnstile error-codes:", result.get("error-codes"))
         return (
             False,
             "Cloudflare verification failed.",
         )
 
-    except Exception:
-
+    except Exception as e:
+        print("Turnstile exception:", str(e))
         return (
             False,
             "Unable to verify Cloudflare.",
