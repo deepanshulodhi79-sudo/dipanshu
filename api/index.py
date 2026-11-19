@@ -138,6 +138,10 @@ def authenticated():
     return session.get("authenticated") is True
 
 
+def turnstile_already_verified():
+    return session.get("turnstile_verified") is True
+
+
 def clean_header(value, max_length=998):
     value = str(value or "")
     value = value.replace("\r", " ")
@@ -366,6 +370,7 @@ def login():
     session.clear()
     session.permanent = True
     session["authenticated"] = True
+    session["turnstile_verified"] = False
 
     return redirect(url_for("home"))
 
@@ -402,6 +407,7 @@ def home():
     return render_template(
         "index.html",
         turnstile_site_key=TURNSTILE_SITE_KEY,
+        turnstile_verified=turnstile_already_verified(),
     )
 
 
@@ -936,38 +942,42 @@ def send_batch():
 
 
     # =====================================================
-    # TURNSTILE
+    # TURNSTILE (ONCE PER LOGIN SESSION)
     # =====================================================
 
-    forwarded_for = request.headers.get(
-        "X-Forwarded-For"
-    )
+    if not turnstile_already_verified():
 
-    if forwarded_for:
-
-        remote_ip = (
-            forwarded_for
-            .split(",", 1)[0]
-            .strip()
+        forwarded_for = request.headers.get(
+            "X-Forwarded-For"
         )
 
-    else:
+        if forwarded_for:
 
-        remote_ip = request.remote_addr
+            remote_ip = (
+                forwarded_for
+                .split(",", 1)[0]
+                .strip()
+            )
 
-    verified, verify_error = (
-        verify_turnstile(
-            turnstile_token,
-            remote_ip,
+        else:
+
+            remote_ip = request.remote_addr
+
+        verified, verify_error = (
+            verify_turnstile(
+                turnstile_token,
+                remote_ip,
+            )
         )
-    )
 
-    if not verified:
+        if not verified:
 
-        return jsonify({
-            "success": False,
-            "message": verify_error,
-        }), 403
+            return jsonify({
+                "success": False,
+                "message": verify_error,
+            }), 403
+
+        session["turnstile_verified"] = True
 
 
     # =====================================================
@@ -1305,71 +1315,4 @@ def send_batch():
 
     response.headers[
         "Cache-Control"
-    ] = (
-        "no-cache, "
-        "no-store, "
-        "must-revalidate, "
-        "no-transform, "
-        "max-age=0"
-    )
-
-    response.headers[
-        "Pragma"
-    ] = "no-cache"
-
-    response.headers[
-        "Expires"
-    ] = "0"
-
-    response.headers[
-        "X-Accel-Buffering"
-    ] = "no"
-
-    response.headers[
-        "X-Content-Type-Options"
-    ] = "nosniff"
-
-    return response
-
-
-# =========================================================
-# HEALTH
-# =========================================================
-
-@app.route("/health")
-def health():
-
-    return jsonify({
-        "status": "ok",
-        "service": "YATENDRA Mail Console",
-        "mailer": "Gmail SMTP",
-        "parallel_sends":
-            MAX_PARALLEL_SENDS,
-        "send_delay":
-            SEND_DELAY_SECONDS,
-        "max_recipients":
-            MAX_RECIPIENTS,
-        "placeholders": [
-            "{{hi}}",
-            "{{hello}}",
-            "{{thanks}}",
-            "{{name}}",
-            "{{email}}",
-            "{{ref_code}}",
-        ],
-        "authenticated":
-            authenticated(),
-    })
-
-
-# =========================================================
-# LOCAL DEVELOPMENT
-# =========================================================
-
-if __name__ == "__main__":
-
-    app.run(
-        host="0.0.0.0",
-        port=5000,
-        debug=False,
-    )
+    ] =
