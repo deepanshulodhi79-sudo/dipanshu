@@ -262,6 +262,8 @@ def verify_turnstile(token, remote_ip=None):
             "TURNSTILE_SECRET_KEY is not configured.",
         )
 
+    token = str(token or "").strip()
+
     if not token:
         return (
             False,
@@ -303,11 +305,18 @@ def verify_turnstile(token, remote_ip=None):
         if result.get("success") is True:
             return True, None
 
-        # Print error codes to Vercel logs for debugging
-        print("Turnstile error-codes:", result.get("error-codes"))
+        error_codes = result.get("error-codes") or []
+        print("Turnstile error-codes:", error_codes)
+
+        if "timeout-or-duplicate" in error_codes:
+            return (
+                False,
+                "Cloudflare token already used or expired. Please verify again.",
+            )
+
         return (
             False,
-            "Cloudflare verification failed.",
+            f"Cloudflare verification failed ({', '.join(error_codes) or 'unknown'}).",
         )
 
     except Exception as e:
@@ -1060,8 +1069,8 @@ def send_batch():
                                 failed_count,
                             "remaining":
                                 total
-                                - sent_count
-                                - failed_count,
+- sent_count
+- failed_count,
                         }
 
                     else:
@@ -1088,8 +1097,8 @@ def send_batch():
                                 failed_count,
                             "remaining":
                                 total
-                                - sent_count
-                                - failed_count,
+- sent_count
+- failed_count,
                         }
 
                     yield (
@@ -1123,8 +1132,8 @@ def send_batch():
                                 failed_count,
                             "remaining":
                                 total
-                                - sent_count
-                                - failed_count,
+- sent_count
+- failed_count,
                         })
                         + "\n"
                     )
@@ -1152,8 +1161,8 @@ def send_batch():
                                 failed_count,
                             "remaining":
                                 total
-                                - sent_count
-                                - failed_count,
+- sent_count
+- failed_count,
                         })
                         + "\n"
                     )
@@ -1186,8 +1195,8 @@ def send_batch():
                                 failed_count,
                             "remaining":
                                 total
-                                - sent_count
-                                - failed_count,
+- sent_count
+- failed_count,
                         })
                         + "\n"
                     )
@@ -1215,8 +1224,8 @@ def send_batch():
                                 failed_count,
                             "remaining":
                                 total
-                                - sent_count
-                                - failed_count,
+- sent_count
+- failed_count,
                         })
                         + "\n"
                     )
@@ -1244,8 +1253,8 @@ def send_batch():
                                 failed_count,
                             "remaining":
                                 total
-                                - sent_count
-                                - failed_count,
+- sent_count
+- failed_count,
                         })
                         + "\n"
                     )
@@ -1273,8 +1282,8 @@ def send_batch():
                         failed_count,
                     "remaining":
                         total
-                        - sent_count
-                        - failed_count,
+- sent_count
+- failed_count,
                 },
                 ensure_ascii=False,
             )
