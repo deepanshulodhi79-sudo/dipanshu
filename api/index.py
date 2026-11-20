@@ -52,7 +52,7 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=3600,
 )
 
-MAX_RECIPIENTS = 15
+MAX_RECIPIENTS = 25
 SEND_DELAY_SECONDS = 0.8
 EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 
