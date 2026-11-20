@@ -52,8 +52,8 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=3600,
 )
 
-MAX_RECIPIENTS = 25
-SEND_DELAY_SECONDS = 1.2
+MAX_RECIPIENTS = 15
+SEND_DELAY_SECONDS = 0.8
 EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 
 
@@ -208,6 +208,45 @@ def build_smtp_msg(from_email, sender_name, subject, body, is_html, recipient):
     return msg
 
 
+def open_smtp(gmail, app_password):
+    clean_pwd = re.sub(r"\s+", "", app_password)
+    server = smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=20)
+    server.ehlo()
+    server.login(gmail, clean_pwd)
+    return server
+
+
+def close_smtp(server):
+    if server:
+        try:
+            server.quit()
+        except Exception:
+            pass
+
+
+def send_smtp_with_reconnect(server, gmail, app_password, sender_name, subject, body, is_html, recipient):
+    msg = build_smtp_msg(gmail, sender_name, subject, body, is_html, recipient)
+    raw_msg = msg.as_string()
+
+    # Try existing connection once, and if disconnected/dropped, open a fresh one once
+    for attempt in range(2):
+        try:
+            if server is None:
+                server = open_smtp(gmail, app_password)
+            refused = server.sendmail(gmail, [recipient], raw_msg)
+            if refused:
+                return server, {"email": recipient, "result": "failed", "error": "Recipient refused by SMTP."}
+            return server, {"email": recipient, "result": "sent"}
+        except smtplib.SMTPAuthenticationError as e:
+            close_smtp(server)
+            return None, {"email": recipient, "result": "failed", "error": f"Auth failed: {str(e)[:200]}"}
+        except Exception as e:
+            close_smtp(server)
+            server = None
+            if attempt == 1:
+                return None, {"email": recipient, "result": "failed", "error": f"SMTP error: {str(e)[:220]}"}
+
+
 @app.route("/send-batch", methods=["POST"])
 def send_batch():
     if not authenticated():
@@ -277,15 +316,11 @@ def send_batch():
         yield json.dumps({"type": "start", "total": total, "sent": 0, "failed": 0, "remaining": total}) + "\n"
 
         smtp_server = None
-        smtp_err = None
         if not RESEND_API_KEY:
             try:
-                clean_pwd = re.sub(r"\s+", "", app_password)
-                smtp_server = smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=25)
-                smtp_server.ehlo()
-                smtp_server.login(gmail, clean_pwd)
-            except Exception as e:
-                smtp_err = f"SMTP login failed: {str(e)[:250]}"
+                smtp_server = open_smtp(gmail, app_password)
+            except Exception:
+                smtp_server = None
 
         try:
             for idx, r in enumerate(clean_recipients):
@@ -302,17 +337,9 @@ def send_batch():
                     else:
                         res = send_resend(from_addr, sender_name, p_subj, p_body, is_html, r["email"])
                 else:
-                    if smtp_err:
-                        res = {"email": r["email"], "result": "failed", "error": smtp_err}
-                    else:
-                        try:
-                            msg = build_smtp_msg(gmail, sender_name, p_subj, p_body, is_html, r["email"])
-                            refused = smtp_server.sendmail(gmail, [r["email"]], msg.as_string())
-                            res = {"email": r["email"], "result": "failed", "error": "Refused."} if refused else {
-                                "email": r["email"], "result": "sent"
-                            }
-                        except Exception as e:
-                            res = {"email": r["email"], "result": "failed", "error": str(e)[:250]}
+                    smtp_server, res = send_smtp_with_reconnect(
+                        smtp_server, gmail, app_password, sender_name, p_subj, p_body, is_html, r["email"]
+                    )
 
                 if res["result"] == "sent":
                     sent += 1
@@ -330,11 +357,7 @@ def send_batch():
                     "remaining": total - sent - failed,
                 }) + "\n"
         finally:
-            if smtp_server:
-                try:
-                    smtp_server.quit()
-                except Exception:
-                    pass
+            close_smtp(smtp_server)
 
         yield json.dumps({
             "type": "complete",
