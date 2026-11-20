@@ -19,8 +19,8 @@ import urllib.request
 import urllib.parse
 import secrets
 import time
+import html as html_lib
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr, formatdate, make_msgid
@@ -52,7 +52,7 @@ TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "").strip()
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "").strip()
 LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD", "").strip()
 
-# Recommended for Inbox delivery: Resend API + your verified custom domain
+# Best for Inbox placement: Resend API + verified custom domain
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
 DEFAULT_FROM_EMAIL = os.environ.get("FROM_EMAIL", "").strip()
 
@@ -73,16 +73,16 @@ app.config.update(
 
 
 # =========================================================
-# MAIL SETTINGS
+# INBOX-FRIENDLY MAIL SETTINGS
 # =========================================================
 
 MAX_RECIPIENTS = 25
-MAX_PARALLEL_SENDS = 2
 
+# Sequential sending avoids burst patterns that trigger spam filters
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 SMTP_TIMEOUT = 25
-SEND_DELAY_SECONDS = 0.4
+SEND_DELAY_SECONDS = 1.2
 
 
 # =========================================================
@@ -137,25 +137,32 @@ def personalize_template(template, recipient):
     return result
 
 
-def html_to_plain_text(html):
-    text = str(html or "")
+def html_to_plain_text(raw_html):
+    text = str(raw_html or "")
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.I | re.S)
+    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.I | re.S)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
     text = re.sub(r"</p\s*>", "\n\n", text, flags=re.I)
     text = re.sub(r"</div\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<li\s*>", "- ", text, flags=re.I)
+    text = re.sub(r"</li\s*>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
-
-    replacements = {
-        "&nbsp;": " ",
-        "&amp;": "&",
-        "&lt;": "<",
-        "&gt;": ">",
-        "&quot;": '"',
-        "&#39;": "'",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
+    text = html_lib.unescape(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def wrap_clean_html(body_html):
+    stripped = str(body_html or "").strip()
+    if "<html" in stripped.lower():
+        return stripped
+    return (
+        "<!DOCTYPE html>"
+        "<html><head><meta charset=\"utf-8\"></head>"
+        "<body style=\"font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.5;color:#222222;\">"
+        f"{stripped}"
+        "</body></html>"
+    )
 
 
 # =========================================================
@@ -289,8 +296,31 @@ def normalize_recipient(item):
 
 
 # =========================================================
-# SENDERS: RESEND API (PRIMARY) & GMAIL SMTP (FALLBACK)
+# MESSAGE BUILDER & SENDERS
 # =========================================================
+
+def build_smtp_message(from_email, sender_name, subject, body, is_html, recipient):
+    clean_body = str(body or "").replace("\x00", "")
+    sender_domain = from_email.split("@", 1)[1] if "@" in from_email else "gmail.com"
+
+    if is_html:
+        msg = MIMEMultipart("alternative")
+        plain_part = html_to_plain_text(clean_body) or " "
+        html_part = wrap_clean_html(clean_body)
+        msg.attach(MIMEText(plain_part, "plain", "utf-8"))
+        msg.attach(MIMEText(html_part, "html", "utf-8"))
+    else:
+        msg = MIMEText(clean_body, "plain", "utf-8")
+
+    msg["MIME-Version"] = "1.0"
+    msg["Subject"] = subject
+    msg["From"] = formataddr((sender_name, from_email))
+    msg["Reply-To"] = from_email
+    msg["To"] = recipient
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=sender_domain)
+    return msg
+
 
 def send_via_resend(from_address, sender_name, subject, body, is_html, recipient):
     clean_from = clean_header(sender_name, 100)
@@ -299,12 +329,13 @@ def send_via_resend(from_address, sender_name, subject, body, is_html, recipient
 
     payload = {
         "from": formatted_from,
+        "reply_to": from_address,
         "to": [recipient],
         "subject": subject,
         "text": plain_text or " ",
     }
     if is_html:
-        payload["html"] = body
+        payload["html"] = wrap_clean_html(body)
 
     req = urllib.request.Request(
         "https://api.resend.com/emails",
@@ -330,82 +361,17 @@ def send_via_resend(from_address, sender_name, subject, body, is_html, recipient
         return {"email": recipient, "result": "failed", "error": str(e)[:300]}
 
 
-def build_smtp_message(gmail, sender_name, subject, body, is_html, recipient):
-    clean_body = str(body or "").replace("\x00", "")
-    if is_html:
-        msg = MIMEMultipart("alternative")
-        msg.attach(MIMEText(html_to_plain_text(clean_body), "plain", "utf-8"))
-        msg.attach(MIMEText(clean_body, "html", "utf-8"))
-    else:
-        msg = MIMEText(clean_body, "plain", "utf-8")
-
-    msg["Subject"] = subject
-    msg["From"] = formataddr((sender_name, gmail))
-    msg["To"] = recipient
-    msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain="gmail.com")
-    return msg
-
-
-def send_via_gmail_smtp(gmail, app_password, sender_name, subject, body, is_html, recipient):
+def create_smtp_connection(gmail, app_password):
     clean_pwd = re.sub(r"\s+", "", str(app_password or ""))
     context = ssl.create_default_context()
-    server = None
-    try:
-        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=SMTP_TIMEOUT)
-        server.ehlo()
-        server.login(gmail, clean_pwd)
-        msg = build_smtp_message(gmail, sender_name, subject, body, is_html, recipient)
-        refused = server.sendmail(gmail, [recipient], msg.as_string())
-        if refused:
-            return {"email": recipient, "result": "failed", "error": "SMTP refused recipient."}
-        return {"email": recipient, "result": "sent"}
-    finally:
-        if server is not None:
-            try:
-                server.quit()
-            except Exception:
-                pass
-
-
-def send_worker(gmail, app_password, from_override, sender_name, subject, body, is_html, recipient_data):
-    recipient = normalize_email(recipient_data.get("email", ""))
-    personalized_subject = personalize_template(subject, recipient_data)
-    personalized_body = personalize_template(body, recipient_data)
-
-    if SEND_DELAY_SECONDS > 0:
-        time.sleep(SEND_DELAY_SECONDS)
-
-    if RESEND_API_KEY:
-        sender_email = from_override if valid_email(from_override) else DEFAULT_FROM_EMAIL
-        if not valid_email(sender_email):
-            return {
-                "email": recipient,
-                "result": "failed",
-                "error": "Set FROM_EMAIL (verified domain) in Vercel env when using RESEND_API_KEY.",
-            }
-        return send_via_resend(
-            from_address=sender_email,
-            sender_name=sender_name,
-            subject=personalized_subject,
-            body=personalized_body,
-            is_html=is_html,
-            recipient=recipient,
-        )
-
-    return send_via_gmail_smtp(
-        gmail=gmail,
-        app_password=app_password,
-        sender_name=sender_name,
-        subject=personalized_subject,
-        body=personalized_body,
-        is_html=is_html,
-        recipient=recipient,
-    )
+    server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=SMTP_TIMEOUT)
+    server.ehlo()
+    server.login(gmail, clean_pwd)
+    return server
 
 
 # =========================================================
-# SEND BATCH
+# SEND BATCH (SEQUENTIAL SINGLE-CONNECTION FOR INBOX HEALTH)
 # =========================================================
 
 @app.route("/send-batch", methods=["POST"])
@@ -425,8 +391,8 @@ def send_batch():
         }), 400
 
     sender_name = clean_header(data.get("sender_name", ""), 200)
-    gmail = clean_header(data.get("gmail", ""), 254)
-    from_override = clean_header(data.get("from_email", ""), 254)
+    gmail = clean_header(data.get("gmail", ""), 254).lower()
+    from_override = clean_header(data.get("from_email", ""), 254).lower()
     app_password = str(data.get("app_password", "")).strip()
     subject = clean_header(data.get("subject", ""), 998)
     body = str(data.get("body", ""))
@@ -438,7 +404,7 @@ def send_batch():
         return jsonify({"success": False, "message": "Sender Name is required."}), 400
 
     if not RESEND_API_KEY:
-        if not valid_email(gmail) or not gmail.lower().endswith("@gmail.com"):
+        if not valid_email(gmail) or not gmail.endswith("@gmail.com"):
             return jsonify({"success": False, "message": "Enter a valid @gmail.com address."}), 400
         if not app_password:
             return jsonify({"success": False, "message": "Google App Password is required."}), 400
@@ -473,7 +439,6 @@ def send_batch():
     if not clean_recipients:
         return jsonify({"success": False, "message": "No valid recipients found."}), 400
 
-    # Turnstile: verified once per login session
     if not turnstile_already_verified():
         forwarded_for = request.headers.get("X-Forwarded-For")
         remote_ip = forwarded_for.split(",", 1)[0].strip() if forwarded_for else request.remote_addr
@@ -498,59 +463,82 @@ def send_batch():
             "remaining": total,
         }, ensure_ascii=False) + "\n"
 
-        worker_count = min(MAX_PARALLEL_SENDS, total)
-        executor = ThreadPoolExecutor(max_workers=worker_count)
-        future_map = {}
+        smtp_server = None
+        smtp_init_error = None
+
+        if not RESEND_API_KEY:
+            try:
+                smtp_server = create_smtp_connection(gmail, app_password)
+            except smtplib.SMTPAuthenticationError:
+                smtp_init_error = "Gmail authentication failed. Check Gmail and App Password."
+            except Exception as exc:
+                smtp_init_error = f"SMTP connection failed: {str(exc)[:300]}"
 
         try:
-            for recipient_data in clean_recipients:
-                future = executor.submit(
-                    send_worker,
-                    gmail,
-                    app_password,
-                    from_override,
-                    sender_name,
-                    subject,
-                    body,
-                    is_html,
-                    recipient_data,
-                )
-                future_map[future] = recipient_data
+            for index, recipient_data in enumerate(clean_recipients):
+                recipient = recipient_data["email"]
+                personalized_subject = personalize_template(subject, recipient_data)
+                personalized_body = personalize_template(body, recipient_data)
 
-            for future in as_completed(future_map):
-                recipient = future_map[future]["email"]
-                try:
-                    result = future.result()
-                    if result.get("result") == "sent":
-                        sent_count += 1
-                        event = {
-                            "type": "progress",
-                            "email": recipient,
-                            "result": "sent",
-                            "total": total,
-                            "sent": sent_count,
-                            "failed": failed_count,
-                            "remaining": total - sent_count - failed_count,
-                        }
-                    else:
-                        failed_count += 1
-                        event = {
-                            "type": "progress",
+                if index > 0 and SEND_DELAY_SECONDS > 0:
+                    time.sleep(SEND_DELAY_SECONDS)
+
+                if RESEND_API_KEY:
+                    sender_email = from_override if valid_email(from_override) else DEFAULT_FROM_EMAIL
+                    if not valid_email(sender_email):
+                        res = {
                             "email": recipient,
                             "result": "failed",
-                            "error": result.get("error", "Delivery failed."),
-                            "total": total,
-                            "sent": sent_count,
-                            "failed": failed_count,
-                            "remaining": total - sent_count - failed_count,
+                            "error": "Configure FROM_EMAIL (verified domain) in Vercel env.",
                         }
-                except Exception as exc:
+                    else:
+                        res = send_via_resend(
+                            from_address=sender_email,
+                            sender_name=sender_name,
+                            subject=personalized_subject,
+                            body=personalized_body,
+                            is_html=is_html,
+                            recipient=recipient,
+                        )
+                else:
+                    if smtp_init_error:
+                        res = {"email": recipient, "result": "failed", "error": smtp_init_error}
+                    else:
+                        try:
+                            msg = build_smtp_message(
+                                from_email=gmail,
+                                sender_name=sender_name,
+                                subject=personalized_subject,
+                                body=personalized_body,
+                                is_html=is_html,
+                                recipient=recipient,
+                            )
+                            refused = smtp_server.sendmail(gmail, [recipient], msg.as_string())
+                            if refused:
+                                res = {"email": recipient, "result": "failed", "error": "SMTP refused recipient."}
+                            else:
+                                res = {"email": recipient, "result": "sent"}
+                        except Exception as exc:
+                            res = {"email": recipient, "result": "failed", "error": str(exc)[:400]}
+
+                if res.get("result") == "sent":
+                    sent_count += 1
+                    event = {
+                        "type": "progress",
+                        "email": recipient,
+                        "result": "sent",
+                        "total": total,
+                        "sent": sent_count,
+                        "failed": failed_count,
+                        "remaining": total - sent_count - failed_count,
+                    }
+                else:
                     failed_count += 1
                     event = {
                         "type": "progress",
                         "email": recipient,
                         "result": "failed",
-                        "error": str(exc)[:500],
+                        "error": res.get("error", "Delivery failed."),
                         "total": total,
                         "sent": sent_count,
                         "failed": failed_count,
@@ -560,7 +548,11 @@ def send_batch():
                 yield json.dumps(event, ensure_ascii=False) + "\n"
 
         finally:
-            executor.shutdown(wait=True)
+            if smtp_server is not None:
+                try:
+                    smtp_server.quit()
+                except Exception:
+                    pass
 
         yield json.dumps({
             "type": "complete",
@@ -592,7 +584,7 @@ def send_batch():
 def health():
     return jsonify({
         "status": "ok",
-        "provider": "Resend API" if RESEND_API_KEY else "Gmail SMTP",
+        "provider": "Resend API" if RESEND_API_KEY else "Gmail SMTP (Sequential)",
         "turnstile_verified_in_session": turnstile_already_verified(),
         "authenticated": authenticated(),
     })
