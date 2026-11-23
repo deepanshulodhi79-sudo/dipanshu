@@ -38,8 +38,6 @@ SESSION_SECRET = os.environ.get("SESSION_SECRET", "").strip()
 TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "").strip()
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "").strip()
 LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD", "").strip()
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
-DEFAULT_FROM_EMAIL = os.environ.get("FROM_EMAIL", "").strip()
 
 if not SESSION_SECRET or not LOGIN_PASSWORD:
     raise RuntimeError("SESSION_SECRET and LOGIN_PASSWORD are required.")
@@ -53,7 +51,11 @@ app.config.update(
 )
 
 MAX_RECIPIENTS = 25
-SEND_DELAY_SECONDS = 0.8
+SEND_DELAY_SECONDS = 0.5
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 465
+SMTP_TIMEOUT = 25
+
 EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 
 
@@ -155,43 +157,8 @@ def home():
     )
 
 
-def send_resend(from_addr, sender_name, subject, body, is_html, recipient):
-    from_hdr = f"{clean_header(sender_name, 100)} <{from_addr}>" if sender_name else from_addr
-    payload = {
-        "from": from_hdr,
-        "reply_to": from_addr,
-        "to": [recipient],
-        "subject": subject,
-        "text": to_plain(body) if is_html else body,
-    }
-    if is_html:
-        payload["html"] = body
-
-    req = urllib.request.Request(
-        "https://api.resend.com/emails",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-        return {"email": recipient, "result": "sent"} if res.get("id") else {
-            "email": recipient, "result": "failed", "error": "No ID returned by Resend."
-        }
-    except urllib.error.HTTPError as e:
-        err = e.read().decode("utf-8", errors="ignore")
-        return {"email": recipient, "result": "failed", "error": f"Resend {e.code}: {err[:250]}"}
-    except Exception as e:
-        return {"email": recipient, "result": "failed", "error": str(e)[:250]}
-
-
-def build_smtp_msg(from_email, sender_name, subject, body, is_html, recipient):
+def build_message(gmail, sender_name, subject, body, is_html, recipient):
     clean_body = str(body or "").replace("\x00", "")
-    domain = from_email.split("@", 1)[1] if "@" in from_email else "gmail.com"
     if is_html:
         msg = MIMEMultipart("alternative")
         msg.attach(MIMEText(to_plain(clean_body) or " ", "plain", "utf-8"))
@@ -200,17 +167,16 @@ def build_smtp_msg(from_email, sender_name, subject, body, is_html, recipient):
         msg = MIMEText(clean_body, "plain", "utf-8")
 
     msg["Subject"] = subject
-    msg["From"] = formataddr((sender_name, from_email))
-    msg["Reply-To"] = from_email
+    msg["From"] = formataddr((sender_name, gmail))
     msg["To"] = recipient
     msg["Date"] = formatdate(localtime=True)
-    msg["Message-ID"] = make_msgid(domain=domain)
+    msg["Message-ID"] = make_msgid(domain="gmail.com")
     return msg
 
 
 def open_smtp(gmail, app_password):
     clean_pwd = re.sub(r"\s+", "", app_password)
-    server = smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=20)
+    server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ssl.create_default_context(), timeout=SMTP_TIMEOUT)
     server.ehlo()
     server.login(gmail, clean_pwd)
     return server
@@ -225,21 +191,20 @@ def close_smtp(server):
 
 
 def send_smtp_with_reconnect(server, gmail, app_password, sender_name, subject, body, is_html, recipient):
-    msg = build_smtp_msg(gmail, sender_name, subject, body, is_html, recipient)
+    msg = build_message(gmail, sender_name, subject, body, is_html, recipient)
     raw_msg = msg.as_string()
 
-    # Try existing connection once, and if disconnected/dropped, open a fresh one once
     for attempt in range(2):
         try:
             if server is None:
                 server = open_smtp(gmail, app_password)
             refused = server.sendmail(gmail, [recipient], raw_msg)
             if refused:
-                return server, {"email": recipient, "result": "failed", "error": "Recipient refused by SMTP."}
+                return server, {"email": recipient, "result": "failed", "error": "SMTP refused recipient."}
             return server, {"email": recipient, "result": "sent"}
-        except smtplib.SMTPAuthenticationError as e:
+        except smtplib.SMTPAuthenticationError:
             close_smtp(server)
-            return None, {"email": recipient, "result": "failed", "error": f"Auth failed: {str(e)[:200]}"}
+            return None, {"email": recipient, "result": "failed", "error": "Gmail authentication failed."}
         except Exception as e:
             close_smtp(server)
             server = None
@@ -258,7 +223,6 @@ def send_batch():
 
     sender_name = clean_header(data.get("sender_name", ""), 200)
     gmail = clean_header(data.get("gmail", ""), 254).lower()
-    from_override = clean_header(data.get("from_email", ""), 254).lower()
     app_password = str(data.get("app_password", "")).strip()
     subject = clean_header(data.get("subject", ""), 998)
     body = str(data.get("body", ""))
@@ -266,12 +230,14 @@ def send_batch():
     recipients = data.get("recipients", [])
     turnstile_token = str(data.get("turnstile_token", "")).strip()
 
-    if not sender_name or not subject or not body.strip():
-        return jsonify({"success": False, "message": "Sender name, subject, and body are required."}), 400
-
-    if not RESEND_API_KEY and (not valid_email(gmail) or not gmail.endswith("@gmail.com") or not app_password):
-        return jsonify({"success": False, "message": "Valid @gmail.com and App Password are required."}), 400
-
+    if not sender_name:
+        return jsonify({"success": False, "message": "Sender Name is required."}), 400
+    if not valid_email(gmail) or not gmail.endswith("@gmail.com"):
+        return jsonify({"success": False, "message": "Enter a valid @gmail.com address."}), 400
+    if not app_password:
+        return jsonify({"success": False, "message": "Google App Password is required."}), 400
+    if not subject or not body.strip():
+        return jsonify({"success": False, "message": "Subject and message body are required."}), 400
     if not isinstance(recipients, list):
         return jsonify({"success": False, "message": "Invalid recipient list."}), 400
 
@@ -316,11 +282,10 @@ def send_batch():
         yield json.dumps({"type": "start", "total": total, "sent": 0, "failed": 0, "remaining": total}) + "\n"
 
         smtp_server = None
-        if not RESEND_API_KEY:
-            try:
-                smtp_server = open_smtp(gmail, app_password)
-            except Exception:
-                smtp_server = None
+        try:
+            smtp_server = open_smtp(gmail, app_password)
+        except Exception:
+            smtp_server = None
 
         try:
             for idx, r in enumerate(clean_recipients):
@@ -330,16 +295,9 @@ def send_batch():
                 p_subj = personalize(subject, r)
                 p_body = personalize(body, r)
 
-                if RESEND_API_KEY:
-                    from_addr = from_override if valid_email(from_override) else DEFAULT_FROM_EMAIL
-                    if not valid_email(from_addr):
-                        res = {"email": r["email"], "result": "failed", "error": "Set FROM_EMAIL in env."}
-                    else:
-                        res = send_resend(from_addr, sender_name, p_subj, p_body, is_html, r["email"])
-                else:
-                    smtp_server, res = send_smtp_with_reconnect(
-                        smtp_server, gmail, app_password, sender_name, p_subj, p_body, is_html, r["email"]
-                    )
+                smtp_server, res = send_smtp_with_reconnect(
+                    smtp_server, gmail, app_password, sender_name, p_subj, p_body, is_html, r["email"]
+                )
 
                 if res["result"] == "sent":
                     sent += 1
@@ -379,7 +337,7 @@ def send_batch():
 def health():
     return jsonify({
         "status": "ok",
-        "provider": "Resend API" if RESEND_API_KEY else "Gmail SMTP",
+        "mailer": "Gmail SMTP",
         "turnstile_verified": turnstile_verified(),
     })
 
