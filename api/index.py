@@ -14,6 +14,8 @@ import ssl
 import re
 import os
 import json
+import sys
+import traceback
 import urllib.request
 import urllib.parse
 import secrets
@@ -59,6 +61,11 @@ SMTP_TIMEOUT = 25
 EMAIL_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 
 
+def log(msg):
+    """Simple console logger so you can see what's actually happening on the server."""
+    print(f"[mailer] {msg}", file=sys.stderr, flush=True)
+
+
 def valid_email(v):
     return isinstance(v, str) and 0 < len(v.strip()) <= 254 and bool(EMAIL_RE.fullmatch(v.strip()))
 
@@ -77,6 +84,17 @@ def turnstile_verified():
 
 def clean_header(v, limit=998):
     return str(v or "").replace("\r", " ").replace("\n", " ").strip()[:limit]
+
+
+def to_bool(v):
+    """Accepts real booleans AND string/number forms ('true', '1', 1, etc.)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v == 1
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "on")
+    return False
 
 
 def personalize(text, r):
@@ -116,10 +134,12 @@ def verify_turnstile(token, remote_ip=None):
         if data.get("success") is True:
             return True, None
         codes = data.get("error-codes") or []
+        log(f"Turnstile failed: {codes}")
         if "timeout-or-duplicate" in codes:
             return False, "Cloudflare token expired or already used. Verify again."
         return False, f"Cloudflare verification failed ({', '.join(codes) or 'unknown'})."
     except Exception:
+        log("Turnstile verification exception:\n" + traceback.format_exc())
         return False, "Unable to verify Cloudflare."
 
 
@@ -169,6 +189,7 @@ def build_message(gmail, sender_name, subject, body, is_html, recipient):
     msg["Subject"] = subject
     msg["From"] = formataddr((sender_name, gmail))
     msg["To"] = recipient
+    msg["Reply-To"] = gmail
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain="gmail.com")
     return msg
@@ -179,6 +200,7 @@ def open_smtp(gmail, app_password):
     server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ssl.create_default_context(), timeout=SMTP_TIMEOUT)
     server.ehlo()
     server.login(gmail, clean_pwd)
+    log(f"SMTP login OK for {gmail}")
     return server
 
 
@@ -200,12 +222,16 @@ def send_smtp_with_reconnect(server, gmail, app_password, sender_name, subject, 
                 server = open_smtp(gmail, app_password)
             refused = server.sendmail(gmail, [recipient], raw_msg)
             if refused:
-                return server, {"email": recipient, "result": "failed", "error": "SMTP refused recipient."}
+                log(f"SMTP refused {recipient}: {refused}")
+                return server, {"email": recipient, "result": "failed", "error": f"SMTP refused recipient: {refused}"}
+            log(f"SMTP accepted message for {recipient} (Message-ID: {msg['Message-ID']})")
             return server, {"email": recipient, "result": "sent"}
-        except smtplib.SMTPAuthenticationError:
+        except smtplib.SMTPAuthenticationError as e:
+            log(f"SMTP auth error for {gmail}: {e}")
             close_smtp(server)
-            return None, {"email": recipient, "result": "failed", "error": "Gmail authentication failed."}
+            return None, {"email": recipient, "result": "failed", "error": "Gmail authentication failed. Check the App Password (not your normal Gmail password)."}
         except Exception as e:
+            log(f"SMTP error sending to {recipient} (attempt {attempt + 1}): {traceback.format_exc()}")
             close_smtp(server)
             server = None
             if attempt == 1:
@@ -226,7 +252,7 @@ def send_batch():
     app_password = str(data.get("app_password", "")).strip()
     subject = clean_header(data.get("subject", ""), 998)
     body = str(data.get("body", ""))
-    is_html = data.get("is_html", False) is True
+    is_html = to_bool(data.get("is_html", False))
     recipients = data.get("recipients", [])
     turnstile_token = str(data.get("turnstile_token", "")).strip()
 
@@ -273,6 +299,22 @@ def send_batch():
             return jsonify({"success": False, "message": err}), 403
         session["turnstile_verified"] = True
 
+    # Fail fast: try logging in once *before* opening the stream, so a bad
+    # app password / 2FA issue is reported clearly instead of silently
+    # failing per-recipient inside the stream.
+    try:
+        test_server = open_smtp(gmail, app_password)
+        close_smtp(test_server)
+    except smtplib.SMTPAuthenticationError:
+        log(f"Pre-flight SMTP auth failed for {gmail}")
+        return jsonify({
+            "success": False,
+            "message": "Gmail authentication failed. Make sure 2-Step Verification is ON and you're using a 16-character App Password (not your login password).",
+        }), 401
+    except Exception as e:
+        log("Pre-flight SMTP check failed:\n" + traceback.format_exc())
+        return jsonify({"success": False, "message": f"Could not connect to Gmail SMTP: {str(e)[:220]}"}), 502
+
     @stream_with_context
     def generate():
         total = len(clean_recipients)
@@ -285,6 +327,7 @@ def send_batch():
         try:
             smtp_server = open_smtp(gmail, app_password)
         except Exception:
+            log("Could not open SMTP connection for batch:\n" + traceback.format_exc())
             smtp_server = None
 
         try:
@@ -317,6 +360,7 @@ def send_batch():
         finally:
             close_smtp(smtp_server)
 
+        log(f"Batch complete: {sent} sent, {failed} failed, {total} total")
         yield json.dumps({
             "type": "complete",
             "success": True,
